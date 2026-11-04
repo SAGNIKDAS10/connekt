@@ -133,3 +133,32 @@ begin
   alter publication supabase_realtime add table public.room_playback;
 exception when duplicate_object then null;
 end $$;
+
+
+-- Secure room-code join RPC: allows joining by code without exposing all rooms.
+create or replace function public.join_room_by_code(p_code text)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_room uuid;
+begin
+  if auth.uid() is null then
+    raise exception 'You must be signed in to join a room';
+  end if;
+  select id into target_room
+  from public.rooms
+  where code = upper(trim(p_code));
+  if target_room is null then
+    raise exception 'Room code not found';
+  end if;
+  insert into public.room_members (room_id, user_id)
+  values (target_room, auth.uid())
+  on conflict (room_id, user_id) do nothing;
+  return target_room;
+end;
+$$;
+
+grant execute on function public.join_room_by_code(text) to authenticated;

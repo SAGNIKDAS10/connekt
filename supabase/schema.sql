@@ -43,13 +43,26 @@ create table if not exists public.room_playback (
   updated_at timestamptz not null default now()
 );
 
+-- Security-definer helper avoids recursive RLS policies on room_members.
+create or replace function public.is_room_member(p_room_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.room_members
+    where room_id = p_room_id and user_id = auth.uid()
+  );
+$$;
+
 alter table public.profiles enable row level security;
 alter table public.rooms enable row level security;
 alter table public.room_members enable row level security;
 alter table public.tracks enable row level security;
 alter table public.room_playback enable row level security;
 
--- Profiles: signed-in users can read profiles and edit only their own.
 drop policy if exists "profiles readable by authenticated" on public.profiles;
 create policy "profiles readable by authenticated" on public.profiles for select to authenticated using (true);
 drop policy if exists "users insert own profile" on public.profiles;
@@ -57,12 +70,8 @@ create policy "users insert own profile" on public.profiles for insert to authen
 drop policy if exists "users update own profile" on public.profiles;
 create policy "users update own profile" on public.profiles for update to authenticated using (auth.uid() = id) with check (auth.uid() = id);
 
--- A room is visible to its members; the host creates it.
 drop policy if exists "members can view rooms" on public.rooms;
-create policy "members can view rooms" on public.rooms for select to authenticated using (
-  exists (select 1 from public.room_members m where m.room_id = id and m.user_id = auth.uid())
-  or host_id = auth.uid()
-);
+create policy "members can view rooms" on public.rooms for select to authenticated using (host_id = auth.uid() or public.is_room_member(id));
 drop policy if exists "signed in users create rooms" on public.rooms;
 create policy "signed in users create rooms" on public.rooms for insert to authenticated with check (host_id = auth.uid());
 drop policy if exists "host updates room" on public.rooms;
@@ -70,41 +79,24 @@ create policy "host updates room" on public.rooms for update to authenticated us
 drop policy if exists "host deletes room" on public.rooms;
 create policy "host deletes room" on public.rooms for delete to authenticated using (host_id = auth.uid());
 
--- Room code lookup and membership: signed-in users may join a room by code.
 drop policy if exists "members can see room members" on public.room_members;
-create policy "members can see room members" on public.room_members for select to authenticated using (
-  user_id = auth.uid() or exists (select 1 from public.room_members mine where mine.room_id = room_id and mine.user_id = auth.uid())
-);
+create policy "members can see room members" on public.room_members for select to authenticated using (user_id = auth.uid() or public.is_room_member(room_id));
 drop policy if exists "users join rooms" on public.room_members;
 create policy "users join rooms" on public.room_members for insert to authenticated with check (user_id = auth.uid());
 drop policy if exists "users leave rooms" on public.room_members;
 create policy "users leave rooms" on public.room_members for delete to authenticated using (user_id = auth.uid());
 
--- Members can read and add queue tracks; users can remove their own tracks.
 drop policy if exists "room members read tracks" on public.tracks;
-create policy "room members read tracks" on public.tracks for select to authenticated using (
-  exists (select 1 from public.room_members m where m.room_id = tracks.room_id and m.user_id = auth.uid())
-);
+create policy "room members read tracks" on public.tracks for select to authenticated using (public.is_room_member(room_id));
 drop policy if exists "room members add tracks" on public.tracks;
-create policy "room members add tracks" on public.tracks for insert to authenticated with check (
-  added_by = auth.uid() and exists (select 1 from public.room_members m where m.room_id = tracks.room_id and m.user_id = auth.uid())
-);
+create policy "room members add tracks" on public.tracks for insert to authenticated with check (added_by = auth.uid() and public.is_room_member(room_id));
 drop policy if exists "users remove own tracks" on public.tracks;
-create policy "users remove own tracks" on public.tracks for delete to authenticated using (
-  added_by = auth.uid() and exists (select 1 from public.room_members m where m.room_id = tracks.room_id and m.user_id = auth.uid())
-);
+create policy "users remove own tracks" on public.tracks for delete to authenticated using (added_by = auth.uid() and public.is_room_member(room_id));
 
--- Members can read/update shared playback state.
 drop policy if exists "room members read playback" on public.room_playback;
-create policy "room members read playback" on public.room_playback for select to authenticated using (
-  exists (select 1 from public.room_members m where m.room_id = room_playback.room_id and m.user_id = auth.uid())
-);
+create policy "room members read playback" on public.room_playback for select to authenticated using (public.is_room_member(room_id));
 drop policy if exists "room members write playback" on public.room_playback;
-create policy "room members write playback" on public.room_playback for all to authenticated using (
-  exists (select 1 from public.room_members m where m.room_id = room_playback.room_id and m.user_id = auth.uid())
-) with check (
-  exists (select 1 from public.room_members m where m.room_id = room_playback.room_id and m.user_id = auth.uid())
-);
+create policy "room members write playback" on public.room_playback for all to authenticated using (public.is_room_member(room_id)) with check (public.is_room_member(room_id));
 
 -- Create a profile automatically after email signup.
 create or replace function public.handle_new_user()
